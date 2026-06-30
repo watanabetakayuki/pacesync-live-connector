@@ -11,6 +11,8 @@ import {
   ViewerEvent,
   SubscribeEvent,
   RoomInfo,
+  ContentRestriction,
+  RestrictionType,
 } from './types';
 import { refreshSessionFromChrome } from './session';
 import { decodeWebcastResponse, decodeMessage } from './proto/decoder';
@@ -18,21 +20,45 @@ import { decodeWebcastResponse, decodeMessage } from './proto/decoder';
 const WEBCAST_BASE = 'https://webcast.tiktok.com/webcast/im/fetch/';
 const TIKTOK_BASE  = 'https://www.tiktok.com';
 
+/** 4003xxx ステータスコード + prompts フィールドから制限種別を分類する */
+function classifyRestriction(apiStatusCode: number, data?: any): ContentRestriction {
+  const base = { apiStatusCode };
+
+  if (apiStatusCode === 4003110) return { ...base, type: 'AGE_GATE',     bypassable: true,  label: '年齢制限 (18+)' };
+  if (apiStatusCode === 4003120) return { ...base, type: 'PRIVATE',      bypassable: false, label: '非公開アカウント' };
+  if (apiStatusCode === 4003130) return { ...base, type: 'REGION_BLOCK', bypassable: false, label: '地域制限' };
+  if (apiStatusCode === 4003140) return { ...base, type: 'SUBSCRIPTION', bypassable: false, label: 'サブスク限定' };
+
+  const promptsStr = data?.prompts ? JSON.stringify(data.prompts).toLowerCase() : '';
+  if (promptsStr.includes('age') || promptsStr.includes('adult') || promptsStr.includes('18'))
+    return { ...base, type: 'AGE_GATE',     bypassable: true,  label: '年齢制限 (18+)' };
+  if (promptsStr.includes('subscri') || promptsStr.includes('series'))
+    return { ...base, type: 'SUBSCRIPTION', bypassable: false, label: 'サブスク限定' };
+  if (promptsStr.includes('region') || promptsStr.includes('country'))
+    return { ...base, type: 'REGION_BLOCK', bypassable: false, label: '地域制限' };
+  if (promptsStr.includes('private') || promptsStr.includes('follower'))
+    return { ...base, type: 'PRIVATE',      bypassable: false, label: '非公開 / フォロワー限定' };
+
+  return { ...base, type: 'UNKNOWN', bypassable: true, label: `コンテンツ制限 (${apiStatusCode})` };
+}
+
 export interface TikTokLiveConnectorEvents {
-  chat:       (event: ChatEvent) => void;
-  gift:       (event: GiftEvent) => void;
-  like:       (event: LikeEvent) => void;
-  follow:     (event: FollowEvent) => void;
-  share:      (event: ShareEvent) => void;
-  viewer:     (event: ViewerEvent) => void;
-  subscribe:  (event: SubscribeEvent) => void;
-  connect:    (roomId: string) => void;
-  disconnect: (reason: string) => void;
-  error:      (err: Error) => void;
+  chat:        (event: ChatEvent) => void;
+  gift:        (event: GiftEvent) => void;
+  like:        (event: LikeEvent) => void;
+  follow:      (event: FollowEvent) => void;
+  share:       (event: ShareEvent) => void;
+  viewer:      (event: ViewerEvent) => void;
+  subscribe:   (event: SubscribeEvent) => void;
+  connect:     (roomId: string) => void;
+  disconnect:  (reason: string) => void;
+  error:       (err: Error) => void;
+  /** 接続段階でコンテンツ制限を検知したとき */
+  restriction: (restriction: ContentRestriction) => void;
 }
 
 declare interface TikTokLiveConnector {
-  on<K extends keyof TikTokLiveConnectorEvents>(event: K, listener: TikTokLiveConnectorEvents[K]): this;
+  on<K extends keyof TikTokLiveConnectorEvents>(event: K,  listener: TikTokLiveConnectorEvents[K]): this;
   emit<K extends keyof TikTokLiveConnectorEvents>(event: K, ...args: Parameters<TikTokLiveConnectorEvents[K]>): boolean;
 }
 
@@ -67,6 +93,14 @@ class TikTokLiveConnector extends EventEmitter {
 
     const roomInfo = await this.fetchRoomInfo();
     this.internalRoomId = roomInfo.roomId;
+
+    // 突破不可の制限 → 接続を中断
+    if (roomInfo.restriction && !roomInfo.restriction.bypassable) {
+      const err = new Error(`コンテンツ制限により接続できません: ${roomInfo.restriction.label} (${roomInfo.restriction.apiStatusCode})`);
+      (err as any).code = 'CANNOT_BYPASS';
+      (err as any).restriction = roomInfo.restriction;
+      throw err;
+    }
 
     if (roomInfo.status !== 4) {
       throw new Error(`ライブ配信中ではありません (status: ${roomInfo.status})`);
@@ -332,18 +366,29 @@ class TikTokLiveConnector extends EventEmitter {
     );
     const text = buffer.toString('utf8');
 
-    const roomIdMatch = text.match(/"roomId"\s*:\s*"(\d+)"/);
-    const statusMatch = text.match(/"status"\s*:\s*(\d+)/);
-    const titleMatch  = text.match(/"title"\s*:\s*"([^"]+)"/);
-    const viewerMatch = text.match(/"userCount"\s*:\s*(\d+)/);
+    const roomIdMatch    = text.match(/"roomId"\s*:\s*"(\d+)"/);
+    const statusMatch    = text.match(/"status"\s*:\s*(\d+)/);
+    const titleMatch     = text.match(/"title"\s*:\s*"([^"]+)"/);
+    const viewerMatch    = text.match(/"userCount"\s*:\s*(\d+)/);
+    const apiStatusMatch = text.match(/"status_code"\s*:\s*(\d+)/);
 
     if (!roomIdMatch) throw new Error(`roomIdが見つかりません: @${this.uniqueId}`);
+
+    const apiStatusCode = apiStatusMatch ? parseInt(apiStatusMatch[1]) : 0;
+    let restriction: ContentRestriction | undefined;
+
+    // 4003xxx → コンテンツ制限を検知
+    if (apiStatusCode >= 4003000 && apiStatusCode < 4004000) {
+      restriction = classifyRestriction(apiStatusCode);
+      this.emit('restriction', restriction);
+    }
 
     return {
       roomId:      roomIdMatch[1],
       status:      statusMatch  ? parseInt(statusMatch[1])  : 0,
       title:       titleMatch   ? titleMatch[1]             : '',
       viewerCount: viewerMatch  ? parseInt(viewerMatch[1])  : 0,
+      restriction,
     };
   }
 

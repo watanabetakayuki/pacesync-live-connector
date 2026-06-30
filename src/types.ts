@@ -99,9 +99,30 @@ export type LiveEvent =
   | DisconnectEvent
   | ErrorEvent;
 
+export type RestrictionType =
+  | 'AGE_GATE'      // 4003110 — SESSION_ID で突破可能
+  | 'SUBSCRIPTION'  // 4003140 — 突破不可
+  | 'REGION_BLOCK'  // 4003130 — 突破不可
+  | 'PRIVATE'       // 4003120 — 突破不可
+  | 'UNKNOWN';      // 未分類の 4003xxx
+
+export interface ContentRestriction {
+  type: RestrictionType;
+  bypassable: boolean;
+  label: string;
+  apiStatusCode: number;
+}
+
 export interface RoomInfo {
   roomId: string;
   status: number;
   title: string;
   viewerCount: number;
+  restriction?: ContentRestriction;
+}
+
+export interface RestrictionEvent {
+  type: 'restriction';
+  restriction: ContentRestriction;
+  timestamp: number;
 }

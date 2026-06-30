@@ -1,5 +1,5 @@
 {
-  "name": "pacesync-live-connector",
+  "name": "@shibusawa/pacesync-live-connector",
   "version": "0.1.0",
   "description": "A high-performance TikTok LIVE event connector for PaceSync — receive real-time chat, gifts, and viewer events with automatic session refresh.",
   "main": "dist/index.js",
