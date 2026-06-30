@@ -10,6 +10,10 @@ A high-performance TikTok LIVE event connector for PaceSync — receive real-tim
 - **TypeScript**: 完全な型定義付き
 - **Zero credentials required**: sessionidのみで動作（公式APIキー不要）
 
+## Status
+
+✅ **動作確認済み** (2026-06-30) — roomId取得・Webcastエンドポイント接続を確認
+
 ## Installation
 
 ```bash
