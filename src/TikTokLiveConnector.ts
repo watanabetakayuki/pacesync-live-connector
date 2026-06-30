@@ -20,6 +20,54 @@ import { decodeWebcastResponse, decodeMessage } from './proto/decoder';
 const WEBCAST_BASE = 'https://webcast.tiktok.com/webcast/im/fetch/';
 const TIKTOK_BASE  = 'https://www.tiktok.com';
 
+/** urlList/urls 配列から最適なアイコンURLを選択する */
+function pickProfileUrlFromList(urls: any): string {
+  if (!urls) return '';
+  const list: string[] = (Array.isArray(urls) ? urls : [urls])
+    .map((u: any) => String(u || '').trim())
+    .filter(Boolean);
+  if (!list.length) return '';
+  return (
+    list.find(u => u.includes('jpeg') && !u.includes('shrink:24')) ||
+    list.find(u => u.includes('jpeg')) ||
+    list.find(u => u.includes('.webp') && !u.includes('shrink')) ||
+    list.find(u => u.includes('.webp')) ||
+    list[0]
+  )!;
+}
+
+/** TikTok Webcast ユーザーデータから複数フォールバックでアイコンURLを抽出する */
+function extractProfilePictureUrl(raw: any): string {
+  if (!raw) return '';
+  if (raw.profilePictureUrl) return String(raw.profilePictureUrl);
+
+  const fromList = pickProfileUrlFromList(raw.profilePictureUrls);
+  if (fromList) return fromList;
+
+  const ud = raw.userDetails;
+  if (ud?.profilePictureUrl) return String(ud.profilePictureUrl);
+  const udList = pickProfileUrlFromList(ud?.profilePictureUrls);
+  if (udList) return udList;
+
+  const u = raw.user;
+  if (u?.profilePictureUrl) return String(u.profilePictureUrl);
+  const uList = pickProfileUrlFromList(u?.profilePictureUrls);
+  if (uList) return uList;
+
+  const thumb = raw.avatarThumb || u?.avatarThumb;
+  if (Array.isArray(thumb?.urlList) && thumb.urlList[0]) return String(thumb.urlList[0]);
+  if (Array.isArray(thumb?.urls)    && thumb.urls[0])    return String(thumb.urls[0]);
+
+  if (raw.profilePicture?.urls) {
+    const pp = pickProfileUrlFromList(raw.profilePicture.urls);
+    if (pp) return pp;
+  }
+  if (raw.profilePicture?.url) return String(raw.profilePicture.url);
+  if (raw.avatar) return String(raw.avatar);
+
+  return '';
+}
+
 /** 4003xxx ステータスコード + prompts フィールドから制限種別を分類する */
 function classifyRestriction(apiStatusCode: number, data?: any): ContentRestriction {
   const base = { apiStatusCode };
@@ -333,7 +381,7 @@ class TikTokLiveConnector extends EventEmitter {
       userId:            String(raw?.id ?? ''),
       uniqueId:          raw?.uniqueId ?? '',
       nickname:          raw?.nickname ?? '',
-      profilePictureUrl: raw?.avatarThumb?.urlList?.[0],
+      profilePictureUrl: extractProfilePictureUrl(raw),
       followRole:        raw?.followInfo?.followStatus,
     };
   }
