@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import https from 'https';
+import WebSocket from 'ws';
 import {
   ConnectorOptions,
   ChatEvent,
@@ -38,12 +39,14 @@ declare interface TikTokLiveConnector {
 class TikTokLiveConnector extends EventEmitter {
   private uniqueId: string;
   private options: Required<ConnectorOptions>;
+  private ws: WebSocket | null = null;
   private cursor = '';
   private internalRoomId = '';
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connected = false;
   private destroyed = false;
+  private wsConnected = false;
 
   constructor(uniqueId: string, options: ConnectorOptions) {
     super();
@@ -69,7 +72,8 @@ class TikTokLiveConnector extends EventEmitter {
       throw new Error(`ライブ配信中ではありません (status: ${roomInfo.status})`);
     }
 
-    await this.startPolling();
+    // まずHTTPポーリングでwsUrlを取得し、WebSocketに切り替える
+    await this.initConnection();
     this.connected = true;
     this.emit('connect', this.internalRoomId);
     return roomInfo;
@@ -87,30 +91,108 @@ class TikTokLiveConnector extends EventEmitter {
     this.options.targetIdc = values.targetIdc;
   }
 
-  private async fetchRoomInfo(): Promise<RoomInfo> {
-    const url = `${TIKTOK_BASE}/@${this.uniqueId}/live`;
-    const html = await this.fetchBinary(url);
-    const text = html.toString('utf8');
+  private async initConnection(): Promise<void> {
+    const { wsUrl } = await this.fetchInitial();
 
-    const roomIdMatch = text.match(/"roomId"\s*:\s*"(\d+)"/);
-    const statusMatch = text.match(/"status"\s*:\s*(\d+)/);
-    const titleMatch  = text.match(/"title"\s*:\s*"([^"]+)"/);
-    const viewerMatch = text.match(/"userCount"\s*:\s*(\d+)/);
-
-    if (!roomIdMatch) {
-      throw new Error(`roomIdが見つかりません: @${this.uniqueId}`);
+    if (wsUrl) {
+      this.connectWebSocket(wsUrl);
+    } else {
+      // wsUrlが取れなかった場合はポーリングにフォールバック
+      this.startPolling();
     }
-
-    return {
-      roomId:      roomIdMatch[1],
-      status:      statusMatch  ? parseInt(statusMatch[1])  : 0,
-      title:       titleMatch   ? titleMatch[1]             : '',
-      viewerCount: viewerMatch  ? parseInt(viewerMatch[1])  : 0,
-    };
   }
 
-  private async startPolling(): Promise<void> {
-    await this.fetchMessages();
+  private async fetchInitial(): Promise<{ wsUrl: string | null }> {
+    const params = new URLSearchParams({
+      aid:       '1988',
+      app_name:  'tiktok_web',
+      room_id:   this.internalRoomId,
+      cursor:    '',
+      next_type: '2',
+    });
+
+    const buffer = await this.fetchBinary(
+      `${WEBCAST_BASE}?${params}`,
+      this.buildCookie()
+    );
+
+    if (!buffer.length) return { wsUrl: null };
+
+    try {
+      const response = await decodeWebcastResponse(buffer);
+      if (response.cursor) this.cursor = response.cursor;
+      await this.dispatchProtoMessages(response.messages);
+      return { wsUrl: (response as any).wsUrl ?? null };
+    } catch {
+      try {
+        const json = JSON.parse(buffer.toString('utf8'));
+        if (json?.cursor) this.cursor = json.cursor;
+        await this.dispatchJsonMessages(json?.data?.messages ?? []);
+        return { wsUrl: json?.wsUrl ?? null };
+      } catch {
+        return { wsUrl: null };
+      }
+    }
+  }
+
+  private connectWebSocket(wsUrl: string): void {
+    const url = new URL(wsUrl);
+    url.searchParams.set('cursor', this.cursor);
+
+    const ws = new WebSocket(url.toString(), {
+      headers: {
+        Cookie:     this.buildCookie(),
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+    });
+
+    this.ws = ws;
+
+    ws.on('open', () => {
+      this.wsConnected = true;
+    });
+
+    ws.on('message', async (data: Buffer) => {
+      try {
+        const response = await decodeWebcastResponse(data);
+        if (response.cursor) this.cursor = response.cursor;
+        await this.dispatchProtoMessages(response.messages);
+
+        // ACK送信（TikTokサーバーが要求する場合）
+        if ((response as any).needAck) {
+          this.sendWebSocketAck(response.cursor);
+        }
+      } catch {
+        // バイナリ解析失敗は無視
+      }
+    });
+
+    ws.on('close', (code) => {
+      this.wsConnected = false;
+      this.ws = null;
+      if (!this.destroyed) {
+        this.handleDisconnect(`ws closed (code: ${code})`);
+      }
+    });
+
+    ws.on('error', (err) => {
+      this.emit('error', err);
+      // エラー時はポーリングにフォールバック
+      if (!this.destroyed && !this.wsConnected) {
+        this.startPolling();
+      }
+    });
+  }
+
+  private sendWebSocketAck(cursor: string): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      const ack = JSON.stringify({ cursor, internalExt: '' });
+      this.ws.send(ack);
+    }
+  }
+
+  private startPolling(): void {
+    this.fetchMessages().catch(err => this.handleError(err));
     this.pollTimer = setInterval(
       () => this.fetchMessages().catch(err => this.handleError(err)),
       this.options.pollingInterval
@@ -126,29 +208,24 @@ class TikTokLiveConnector extends EventEmitter {
       next_type: '2',
     });
 
-    const url = `${WEBCAST_BASE}?${params}`;
-    const buffer = await this.fetchBinary(url, this.buildCookie());
+    const buffer = await this.fetchBinary(
+      `${WEBCAST_BASE}?${params}`,
+      this.buildCookie()
+    );
 
-    let response;
+    if (!buffer.length) return;
+
     try {
-      // まずProtobufでデコード試みる
-      response = await decodeWebcastResponse(buffer);
+      const response = await decodeWebcastResponse(buffer);
+      if (response.cursor) this.cursor = response.cursor;
+      await this.dispatchProtoMessages(response.messages);
     } catch {
-      // fallback: JSONとして解釈
       try {
         const json = JSON.parse(buffer.toString('utf8'));
-        if (json?.data?.messages) {
-          this.cursor = json.cursor ?? this.cursor;
-          await this.dispatchJsonMessages(json.data.messages);
-        }
-      } catch {
-        // パース不能なレスポンスは無視
-      }
-      return;
+        if (json?.cursor) this.cursor = json.cursor;
+        await this.dispatchJsonMessages(json?.data?.messages ?? []);
+      } catch { /* 無視 */ }
     }
-
-    if (response.cursor) this.cursor = response.cursor;
-    await this.dispatchProtoMessages(response.messages);
   }
 
   private async dispatchProtoMessages(messages: { method: string; payload: Uint8Array }[]): Promise<void> {
@@ -156,11 +233,8 @@ class TikTokLiveConnector extends EventEmitter {
     for (const msg of messages) {
       try {
         const decoded = await decodeMessage(msg.method, msg.payload);
-        if (!decoded) continue;
-        this.emitFromDecoded(msg.method, decoded, ts);
-      } catch {
-        // 個別メッセージのエラーは無視して継続
-      }
+        if (decoded) this.emitFromDecoded(msg.method, decoded, ts);
+      } catch { /* 個別エラーは無視 */ }
     }
   }
 
@@ -168,67 +242,46 @@ class TikTokLiveConnector extends EventEmitter {
     switch (method) {
       case 'WebcastChatMessage':
         this.emit('chat', {
-          type:      'chat',
-          user:      this.parseUser(d.user),
-          comment:   d.comment ?? '',
-          timestamp: ts,
+          type: 'chat', user: this.parseUser(d.user),
+          comment: d.comment ?? '', timestamp: ts,
         } satisfies ChatEvent);
         break;
 
       case 'WebcastGiftMessage':
         this.emit('gift', {
-          type:         'gift',
-          user:         this.parseUser(d.user),
-          giftId:       d.giftId ?? 0,
-          giftName:     d.gift?.name ?? '',
+          type: 'gift', user: this.parseUser(d.user),
+          giftId: d.giftId ?? 0, giftName: d.gift?.name ?? '',
           diamondCount: d.gift?.diamondCount ?? 0,
-          repeatCount:  d.repeatCount ?? 1,
-          repeatEnd:    d.repeatEnd === 1,
-          timestamp:    ts,
+          repeatCount: d.repeatCount ?? 1, repeatEnd: d.repeatEnd === 1,
+          timestamp: ts,
         } satisfies GiftEvent);
         break;
 
       case 'WebcastLikeMessage':
         this.emit('like', {
-          type:           'like',
-          user:           this.parseUser(d.user),
-          likeCount:      Number(d.count ?? 0),
-          totalLikeCount: Number(d.total ?? 0),
-          timestamp:      ts,
+          type: 'like', user: this.parseUser(d.user),
+          likeCount: Number(d.count ?? 0),
+          totalLikeCount: Number(d.total ?? 0), timestamp: ts,
         } satisfies LikeEvent);
         break;
 
       case 'WebcastSocialMessage':
         if (d.displayType?.includes('follow')) {
-          this.emit('follow', {
-            type:      'follow',
-            user:      this.parseUser(d.user),
-            timestamp: ts,
-          } satisfies FollowEvent);
+          this.emit('follow', { type: 'follow', user: this.parseUser(d.user), timestamp: ts } satisfies FollowEvent);
         } else if (d.displayType?.includes('share')) {
-          this.emit('share', {
-            type:      'share',
-            user:      this.parseUser(d.user),
-            timestamp: ts,
-          } satisfies ShareEvent);
+          this.emit('share', { type: 'share', user: this.parseUser(d.user), timestamp: ts } satisfies ShareEvent);
         }
         break;
 
       case 'WebcastRoomUserSeqMessage':
         this.emit('viewer', {
-          type:        'viewer',
-          viewerCount: Number(d.viewerCount ?? 0),
-          timestamp:   ts,
+          type: 'viewer', viewerCount: Number(d.viewerCount ?? 0), timestamp: ts,
         } satisfies ViewerEvent);
         break;
 
       case 'WebcastMemberMessage':
         if (d.actionId === 7) {
-          this.emit('subscribe', {
-            type:      'subscribe',
-            user:      this.parseUser(d.user),
-            timestamp: ts,
-          } satisfies SubscribeEvent);
+          this.emit('subscribe', { type: 'subscribe', user: this.parseUser(d.user), timestamp: ts } satisfies SubscribeEvent);
         }
         break;
     }
@@ -259,13 +312,12 @@ class TikTokLiveConnector extends EventEmitter {
 
   private fetchBinary(url: string, cookie = ''): Promise<Buffer> {
     return new Promise((resolve, reject) => {
-      const opts = {
+      https.get(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           ...(cookie ? { Cookie: cookie, Referer: 'https://www.tiktok.com/' } : {}),
         },
-      };
-      https.get(url, opts, (res) => {
+      }, (res) => {
         const chunks: Buffer[] = [];
         res.on('data', c => chunks.push(c));
         res.on('end', () => resolve(Buffer.concat(chunks)));
@@ -273,21 +325,51 @@ class TikTokLiveConnector extends EventEmitter {
     });
   }
 
-  private handleError(err: Error): void {
-    this.emit('error', err);
+  private async fetchRoomInfo(): Promise<RoomInfo> {
+    const buffer = await this.fetchBinary(
+      `${TIKTOK_BASE}/@${this.uniqueId}/live`,
+      this.buildCookie()
+    );
+    const text = buffer.toString('utf8');
+
+    const roomIdMatch = text.match(/"roomId"\s*:\s*"(\d+)"/);
+    const statusMatch = text.match(/"status"\s*:\s*(\d+)/);
+    const titleMatch  = text.match(/"title"\s*:\s*"([^"]+)"/);
+    const viewerMatch = text.match(/"userCount"\s*:\s*(\d+)/);
+
+    if (!roomIdMatch) throw new Error(`roomIdが見つかりません: @${this.uniqueId}`);
+
+    return {
+      roomId:      roomIdMatch[1],
+      status:      statusMatch  ? parseInt(statusMatch[1])  : 0,
+      title:       titleMatch   ? titleMatch[1]             : '',
+      viewerCount: viewerMatch  ? parseInt(viewerMatch[1])  : 0,
+    };
+  }
+
+  private handleDisconnect(reason: string): void {
+    this.connected = false;
+    this.emit('disconnect', reason);
     if (this.options.reconnect && !this.destroyed) {
-      this.cleanup();
-      this.connected = false;
-      this.emit('disconnect', 'error');
       this.reconnectTimer = setTimeout(() => {
         this.connect().catch(e => this.emit('error', e));
       }, this.options.reconnectDelay);
     }
   }
 
+  private handleError(err: Error): void {
+    this.emit('error', err);
+    if (this.options.reconnect && !this.destroyed) {
+      this.cleanup();
+      this.handleDisconnect('error');
+    }
+  }
+
   private cleanup(): void {
-    if (this.pollTimer)     { clearInterval(this.pollTimer); this.pollTimer = null; }
-    if (this.reconnectTimer){ clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.pollTimer)      { clearInterval(this.pollTimer); this.pollTimer = null; }
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.ws)             { this.ws.close(); this.ws = null; }
+    this.wsConnected = false;
   }
 }
 

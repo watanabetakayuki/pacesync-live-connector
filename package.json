@@ -4,6 +4,10 @@
   "description": "A high-performance TikTok LIVE event connector for PaceSync — receive real-time chat, gifts, and viewer events with automatic session refresh.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src/proto/webcast.proto"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
