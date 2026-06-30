@@ -1,0 +1,114 @@
+syntax = "proto3";
+
+// TikTok Webcast API — reverse-engineered proto definitions
+
+message WebcastResponse {
+  repeated WebcastMessage messages = 1;
+  string cursor              = 2;
+  string fetchInterval       = 3;
+  int64  serverTime          = 4;
+  string internalExt         = 5;
+  int32  fetchType           = 6;
+  string wsUrl               = 7;
+  int64  wsParam             = 8;
+  bool   hasMore             = 9;
+  string liveCursor          = 10;
+  string rtcRegion           = 11;
+  string imprId              = 12;
+}
+
+message WebcastMessage {
+  string method  = 1;
+  bytes  payload = 2;
+  int64  msgId   = 3;
+  int64  msgType = 4;
+  int64  offset  = 5;
+  bool   needAck = 6;
+  string roomId  = 7;
+}
+
+// ── Chat ─────────────────────────────────────────────────────────────────────
+
+message WebcastChatMessage {
+  WebcastMessageHeader header  = 1;
+  User                 user    = 2;
+  string               comment = 3;
+}
+
+// ── Gift ─────────────────────────────────────────────────────────────────────
+
+message WebcastGiftMessage {
+  WebcastMessageHeader header      = 1;
+  User                 user        = 2;
+  int32                giftId      = 5;
+  int32                repeatCount = 7;
+  int32                repeatEnd   = 9;
+  GiftDetails          gift        = 15;
+}
+
+message GiftDetails {
+  int32  giftId       = 1;
+  int32  diamondCount = 5;
+  string name         = 16;
+}
+
+// ── Like ─────────────────────────────────────────────────────────────────────
+
+message WebcastLikeMessage {
+  WebcastMessageHeader header = 1;
+  User                 user   = 5;
+  int64                count  = 2;
+  int64                total  = 3;
+}
+
+// ── Social (follow / share) ───────────────────────────────────────────────────
+
+message WebcastSocialMessage {
+  WebcastMessageHeader header      = 1;
+  User                 user        = 2;
+  string               displayType = 5;
+}
+
+// ── Member (join / subscribe) ─────────────────────────────────────────────────
+
+message WebcastMemberMessage {
+  WebcastMessageHeader header   = 1;
+  User                 user     = 2;
+  int32                actionId = 10;
+}
+
+// ── Room viewer count ─────────────────────────────────────────────────────────
+
+message WebcastRoomUserSeqMessage {
+  WebcastMessageHeader header      = 1;
+  int64                viewerCount = 3;
+}
+
+// ── Shared structures ─────────────────────────────────────────────────────────
+
+message WebcastMessageHeader {
+  int64  msgId        = 1;
+  int64  serverTime   = 2;
+  string monitorStatus = 4;
+  string roomId       = 5;
+}
+
+message User {
+  int64       id          = 1;
+  string      shortId     = 2;
+  string      uniqueId    = 3;
+  string      nickname    = 4;
+  AvatarThumb avatarThumb = 5;
+  FollowInfo  followInfo  = 9;
+}
+
+message AvatarThumb {
+  repeated string urlList = 1;
+}
+
+message FollowInfo {
+  int32 followingCount = 1;
+  int32 followerCount  = 2;
+  int32 followStatus   = 3;
+  int32 pushStatus     = 4;
+}

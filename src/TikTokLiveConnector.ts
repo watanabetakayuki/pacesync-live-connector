@@ -1,6 +1,5 @@
 import { EventEmitter } from 'events';
 import https from 'https';
-import WebSocket from 'ws';
 import {
   ConnectorOptions,
   ChatEvent,
@@ -13,6 +12,7 @@ import {
   RoomInfo,
 } from './types';
 import { refreshSessionFromChrome } from './session';
+import { decodeWebcastResponse, decodeMessage } from './proto/decoder';
 
 const WEBCAST_BASE = 'https://webcast.tiktok.com/webcast/im/fetch/';
 const TIKTOK_BASE  = 'https://www.tiktok.com';
@@ -38,7 +38,6 @@ declare interface TikTokLiveConnector {
 class TikTokLiveConnector extends EventEmitter {
   private uniqueId: string;
   private options: Required<ConnectorOptions>;
-  private ws: WebSocket | null = null;
   private cursor = '';
   private internalRoomId = '';
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -50,16 +49,15 @@ class TikTokLiveConnector extends EventEmitter {
     super();
     this.uniqueId = uniqueId.replace('@', '');
     this.options = {
-      sessionId:        options.sessionId,
-      targetIdc:        options.targetIdc ?? '',
-      cdpPort:          options.cdpPort ?? 9222,
-      reconnect:        options.reconnect ?? true,
-      reconnectDelay:   options.reconnectDelay ?? 3000,
-      pollingInterval:  options.pollingInterval ?? 1000,
+      sessionId:       options.sessionId,
+      targetIdc:       options.targetIdc ?? '',
+      cdpPort:         options.cdpPort ?? 9222,
+      reconnect:       options.reconnect ?? true,
+      reconnectDelay:  options.reconnectDelay ?? 3000,
+      pollingInterval: options.pollingInterval ?? 1000,
     };
   }
 
-  /** ライブ接続を開始する */
   async connect(): Promise<RoomInfo> {
     if (this.destroyed) throw new Error('このインスタンスは既に破棄されています');
     if (this.connected) throw new Error('既に接続中です');
@@ -77,14 +75,12 @@ class TikTokLiveConnector extends EventEmitter {
     return roomInfo;
   }
 
-  /** 切断してリソースを解放する */
   disconnect(): void {
     this.destroyed = true;
     this.cleanup();
     this.emit('disconnect', 'manual');
   }
 
-  /** sessionidをChromeから自動更新する */
   async refreshSession(): Promise<void> {
     const values = await refreshSessionFromChrome(this.options.cdpPort);
     this.options.sessionId = values.sessionId;
@@ -93,12 +89,13 @@ class TikTokLiveConnector extends EventEmitter {
 
   private async fetchRoomInfo(): Promise<RoomInfo> {
     const url = `${TIKTOK_BASE}/@${this.uniqueId}/live`;
-    const html = await this.fetchHtml(url);
+    const html = await this.fetchBinary(url);
+    const text = html.toString('utf8');
 
-    const roomIdMatch = html.match(/"roomId"\s*:\s*"(\d+)"/);
-    const statusMatch = html.match(/"status"\s*:\s*(\d+)/);
-    const titleMatch  = html.match(/"title"\s*:\s*"([^"]+)"/);
-    const viewerMatch = html.match(/"userCount"\s*:\s*(\d+)/);
+    const roomIdMatch = text.match(/"roomId"\s*:\s*"(\d+)"/);
+    const statusMatch = text.match(/"status"\s*:\s*(\d+)/);
+    const titleMatch  = text.match(/"title"\s*:\s*"([^"]+)"/);
+    const viewerMatch = text.match(/"userCount"\s*:\s*(\d+)/);
 
     if (!roomIdMatch) {
       throw new Error(`roomIdが見つかりません: @${this.uniqueId}`);
@@ -130,89 +127,117 @@ class TikTokLiveConnector extends EventEmitter {
     });
 
     const url = `${WEBCAST_BASE}?${params}`;
-    const cookie = this.buildCookie();
-    const raw = await this.fetchJson(url, cookie);
+    const buffer = await this.fetchBinary(url, this.buildCookie());
 
-    if (!raw?.data) return;
+    let response;
+    try {
+      // まずProtobufでデコード試みる
+      response = await decodeWebcastResponse(buffer);
+    } catch {
+      // fallback: JSONとして解釈
+      try {
+        const json = JSON.parse(buffer.toString('utf8'));
+        if (json?.data?.messages) {
+          this.cursor = json.cursor ?? this.cursor;
+          await this.dispatchJsonMessages(json.data.messages);
+        }
+      } catch {
+        // パース不能なレスポンスは無視
+      }
+      return;
+    }
 
-    this.cursor = raw.cursor ?? this.cursor;
-    this.dispatchMessages(raw.data.messages ?? []);
+    if (response.cursor) this.cursor = response.cursor;
+    await this.dispatchProtoMessages(response.messages);
   }
 
-  private dispatchMessages(messages: any[]): void {
+  private async dispatchProtoMessages(messages: { method: string; payload: Uint8Array }[]): Promise<void> {
     const ts = Date.now();
     for (const msg of messages) {
       try {
-        switch (msg.type) {
-          case 'WebcastChatMessage':
-            this.emit('chat', {
-              type:      'chat',
-              user:      this.parseUser(msg.user),
-              comment:   msg.comment ?? '',
-              timestamp: ts,
-            } satisfies ChatEvent);
-            break;
-
-          case 'WebcastGiftMessage':
-            this.emit('gift', {
-              type:         'gift',
-              user:         this.parseUser(msg.user),
-              giftId:       msg.giftId ?? 0,
-              giftName:     msg.gift?.name ?? '',
-              diamondCount: msg.gift?.diamondCount ?? 0,
-              repeatCount:  msg.repeatCount ?? 1,
-              repeatEnd:    msg.repeatEnd === 1,
-              timestamp:    ts,
-            } satisfies GiftEvent);
-            break;
-
-          case 'WebcastLikeMessage':
-            this.emit('like', {
-              type:           'like',
-              user:           this.parseUser(msg.user),
-              likeCount:      msg.count ?? 0,
-              totalLikeCount: msg.total ?? 0,
-              timestamp:      ts,
-            } satisfies LikeEvent);
-            break;
-
-          case 'WebcastSocialMessage':
-            if (msg.displayType?.includes('follow')) {
-              this.emit('follow', {
-                type:      'follow',
-                user:      this.parseUser(msg.user),
-                timestamp: ts,
-              } satisfies FollowEvent);
-            } else if (msg.displayType?.includes('share')) {
-              this.emit('share', {
-                type:      'share',
-                user:      this.parseUser(msg.user),
-                timestamp: ts,
-              } satisfies ShareEvent);
-            }
-            break;
-
-          case 'WebcastRoomUserSeqMessage':
-            this.emit('viewer', {
-              type:        'viewer',
-              viewerCount: msg.viewerCount ?? 0,
-              timestamp:   ts,
-            } satisfies ViewerEvent);
-            break;
-
-          case 'WebcastMemberMessage':
-            if (msg.actionId === 7) {
-              this.emit('subscribe', {
-                type:      'subscribe',
-                user:      this.parseUser(msg.user),
-                timestamp: ts,
-              } satisfies SubscribeEvent);
-            }
-            break;
-        }
+        const decoded = await decodeMessage(msg.method, msg.payload);
+        if (!decoded) continue;
+        this.emitFromDecoded(msg.method, decoded, ts);
       } catch {
-        // 個別メッセージのパースエラーは無視して継続
+        // 個別メッセージのエラーは無視して継続
       }
+    }
+  }
+
+  private emitFromDecoded(method: string, d: any, ts: number): void {
+    switch (method) {
+      case 'WebcastChatMessage':
+        this.emit('chat', {
+          type:      'chat',
+          user:      this.parseUser(d.user),
+          comment:   d.comment ?? '',
+          timestamp: ts,
+        } satisfies ChatEvent);
+        break;
+
+      case 'WebcastGiftMessage':
+        this.emit('gift', {
+          type:         'gift',
+          user:         this.parseUser(d.user),
+          giftId:       d.giftId ?? 0,
+          giftName:     d.gift?.name ?? '',
+          diamondCount: d.gift?.diamondCount ?? 0,
+          repeatCount:  d.repeatCount ?? 1,
+          repeatEnd:    d.repeatEnd === 1,
+          timestamp:    ts,
+        } satisfies GiftEvent);
+        break;
+
+      case 'WebcastLikeMessage':
+        this.emit('like', {
+          type:           'like',
+          user:           this.parseUser(d.user),
+          likeCount:      Number(d.count ?? 0),
+          totalLikeCount: Number(d.total ?? 0),
+          timestamp:      ts,
+        } satisfies LikeEvent);
+        break;
+
+      case 'WebcastSocialMessage':
+        if (d.displayType?.includes('follow')) {
+          this.emit('follow', {
+            type:      'follow',
+            user:      this.parseUser(d.user),
+            timestamp: ts,
+          } satisfies FollowEvent);
+        } else if (d.displayType?.includes('share')) {
+          this.emit('share', {
+            type:      'share',
+            user:      this.parseUser(d.user),
+            timestamp: ts,
+          } satisfies ShareEvent);
+        }
+        break;
+
+      case 'WebcastRoomUserSeqMessage':
+        this.emit('viewer', {
+          type:        'viewer',
+          viewerCount: Number(d.viewerCount ?? 0),
+          timestamp:   ts,
+        } satisfies ViewerEvent);
+        break;
+
+      case 'WebcastMemberMessage':
+        if (d.actionId === 7) {
+          this.emit('subscribe', {
+            type:      'subscribe',
+            user:      this.parseUser(d.user),
+            timestamp: ts,
+          } satisfies SubscribeEvent);
+        }
+        break;
+    }
+  }
+
+  private async dispatchJsonMessages(messages: any[]): Promise<void> {
+    const ts = Date.now();
+    for (const msg of messages) {
+      try { this.emitFromDecoded(msg.type, msg, ts); } catch { /* 無視 */ }
     }
   }
 
@@ -232,38 +257,18 @@ class TikTokLiveConnector extends EventEmitter {
     return parts.join('; ');
   }
 
-  private fetchHtml(url: string): Promise<string> {
+  private fetchBinary(url: string, cookie = ''): Promise<Buffer> {
     return new Promise((resolve, reject) => {
       const opts = {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          Cookie: this.buildCookie(),
+          ...(cookie ? { Cookie: cookie, Referer: 'https://www.tiktok.com/' } : {}),
         },
       };
       https.get(url, opts, (res) => {
-        let data = '';
-        res.on('data', c => (data += c));
-        res.on('end', () => resolve(data));
-      }).on('error', reject);
-    });
-  }
-
-  private fetchJson(url: string, cookie: string): Promise<any> {
-    return new Promise((resolve, reject) => {
-      const opts = {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          Cookie: cookie,
-          Referer: 'https://www.tiktok.com/',
-        },
-      };
-      https.get(url, opts, (res) => {
-        let data = '';
-        res.on('data', c => (data += c));
-        res.on('end', () => {
-          try { resolve(JSON.parse(data)); }
-          catch { resolve(null); }
-        });
+        const chunks: Buffer[] = [];
+        res.on('data', c => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
       }).on('error', reject);
     });
   }
@@ -283,7 +288,6 @@ class TikTokLiveConnector extends EventEmitter {
   private cleanup(): void {
     if (this.pollTimer)     { clearInterval(this.pollTimer); this.pollTimer = null; }
     if (this.reconnectTimer){ clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
-    if (this.ws)            { this.ws.close(); this.ws = null; }
   }
 }
 
