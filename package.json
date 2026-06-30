@@ -1,6 +1,6 @@
 {
   "name": "@shibusawa/pacesync-live-connector",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A high-performance TikTok LIVE event connector for PaceSync — receive real-time chat, gifts, and viewer events with automatic session refresh.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -13,7 +13,13 @@
     "dev": "tsc --watch",
     "test": "node --experimental-vm-modules node_modules/.bin/jest"
   },
-  "keywords": ["tiktok", "live", "websocket", "streaming", "pacesync"],
+  "keywords": [
+    "tiktok",
+    "live",
+    "websocket",
+    "streaming",
+    "pacesync"
+  ],
   "author": "watanabetakayuki",
   "license": "MIT",
   "dependencies": {
