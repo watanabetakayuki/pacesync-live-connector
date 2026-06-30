@@ -133,6 +133,26 @@ connector.on('restriction', (r) => {
 | アイコンURL抽出 | 基本のみ | ✅ 7パターンフォールバック |
 | 自動再接続 | △ | ✅ |
 
+## PaceSync との連携
+
+このライブラリは [PaceSync](https://app.paceshinc.com) — TikTok LIVE 配信者向けダッシュボードのコアコネクターとして使われています。
+
+年齢制限のある配信アカウントでも弾幕・コメントを取得し続けるための SESSION_ID 管理ツールも同梱しています:
+
+```bash
+# Chrome CDP 経由で sessionid を取得し、PaceSync 本番サーバーを自動更新
+node scripts/refresh-tiktok-session.js --room your_tiktok_username
+```
+
+環境変数でサーバーをカスタマイズ可能:
+
+| 変数名 | デフォルト | 説明 |
+|--------|-----------|------|
+| `PACESYNC_API_URL` | `https://app.paceshinc.com` | PaceSync サーバー URL |
+| `PROD_HOST` | `prod-aws` | SSH ホスト名 |
+| `PROD_DIR` | `/home/ubuntu/pace-sync` | サーバー上のディレクトリ |
+| `CDP_PORT` | `9222` | Chrome CDP ポート |
+
 ## License
 
 MIT
